@@ -29,25 +29,17 @@ fn read_stdin_limited() -> Result<String> {
 
 /// Format detected from the preToolUse JSON input.
 enum HookFormat {
-    /// VS Code Copilot Chat / Claude Code: `tool_name` + `tool_input.command`.
-    VsCode { command: String },
-    /// GitHub Copilot CLI: camelCase `toolName` + `toolArgs` (JSON string), deny-with-suggestion only.
-    CopilotCli { command: String },
+    /// VS Code Copilot Chat: "run_in_terminal" (v1.121+) / "runTerminalCommand" / "Bash".
+    /// Uses deny-with-suggestion because updatedInput is ignored and causes an infinite loop.
+    VsCode,
+    /// Copilot CLI v1.0.24+: "bash" (lowercase).
+    /// Supports transparent rewrite via modifiedArgs.
+    CopilotCli,
     /// Non-bash tool, already uses rtk, or unknown format — pass through silently.
     PassThrough,
 }
 
-/// Output format for deny-with-suggestion responses.
-#[derive(Copy, Clone, Debug)]
-enum CopilotHookOutput {
-    /// VS Code Copilot Chat: hookSpecificOutput wrapper + deny
-    VsCode,
-    /// GitHub Copilot CLI: flat deny
-    CopilotCli,
-}
-
-/// Run the Copilot preToolUse hook.
-/// Auto-detects VS Code Copilot Chat vs Copilot CLI format.
+/// Run the Copilot preToolUse hook (VS Code Chat + Copilot CLI).
 pub fn run_copilot() -> Result<()> {
     let input = read_stdin_limited()?;
 
@@ -64,58 +56,61 @@ pub fn run_copilot() -> Result<()> {
         }
     };
 
-    match detect_format(&v) {
-        HookFormat::VsCode { command } => {
-            handle_copilot_rewrite(&command, CopilotHookOutput::VsCode)
-        }
-        HookFormat::CopilotCli { command } => {
-            handle_copilot_rewrite(&command, CopilotHookOutput::CopilotCli)
-        }
-        HookFormat::PassThrough => Ok(()),
+    let output = match detect_format(&v) {
+        HookFormat::CopilotCli => process_copilot_payload(&v),
+        HookFormat::VsCode => process_vscode_payload(&v),
+        HookFormat::PassThrough => None,
+    };
+    if let Some(output) = output {
+        let _ = writeln!(io::stdout(), "{output}");
     }
+    Ok(())
+}
+
+fn process_vscode_payload(v: &Value) -> Option<Value> {
+    let cmd = v
+        .pointer("/tool_input/command")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())?;
+
+    let rewritten = get_rewritten(cmd)?;
+    audit_log("deny", cmd, &rewritten);
+    Some(build_vscode_deny_output(&rewritten))
+}
+
+fn build_vscode_deny_output(rewritten: &str) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE_KEY,
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!(
+                "Token savings: use `{}` instead (rtk saves 60-90% tokens)",
+                rewritten
+            )
+        }
+    })
 }
 
 fn detect_format(v: &Value) -> HookFormat {
-    // VS Code Copilot Chat / Claude Code: snake_case keys
-    if let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) {
-        if matches!(
-            tool_name,
-            "runTerminalCommand" | "Bash" | "bash" | "run_in_terminal"
-        ) {
-            if let Some(cmd) = v
-                .pointer("/tool_input/command")
-                .and_then(|c| c.as_str())
-                .filter(|c| !c.is_empty())
-            {
-                return HookFormat::VsCode {
-                    command: cmd.to_string(),
-                };
-            }
-        }
+    let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) else {
+        return HookFormat::PassThrough;
+    };
+
+    let has_cmd = v
+        .pointer("/tool_input/command")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+        .is_some();
+
+    if !has_cmd {
         return HookFormat::PassThrough;
     }
 
-    // Copilot CLI: camelCase keys, toolArgs is a JSON-encoded string
-    if let Some(tool_name) = v.get("toolName").and_then(|t| t.as_str()) {
-        if tool_name == "bash" {
-            if let Some(tool_args_str) = v.get("toolArgs").and_then(|t| t.as_str()) {
-                if let Ok(tool_args) = serde_json::from_str::<Value>(tool_args_str) {
-                    if let Some(cmd) = tool_args
-                        .get("command")
-                        .and_then(|c| c.as_str())
-                        .filter(|c| !c.is_empty())
-                    {
-                        return HookFormat::CopilotCli {
-                            command: cmd.to_string(),
-                        };
-                    }
-                }
-            }
-        }
-        return HookFormat::PassThrough;
+    match tool_name {
+        "bash" => HookFormat::CopilotCli,
+        "run_in_terminal" | "runTerminalCommand" | "Bash" => HookFormat::VsCode,
+        _ => HookFormat::PassThrough,
     }
-
-    HookFormat::PassThrough
 }
 
 fn get_rewritten(cmd: &str) -> Option<String> {
@@ -136,41 +131,26 @@ fn get_rewritten(cmd: &str) -> Option<String> {
     Some(rewritten)
 }
 
-fn build_copilot_deny_output(rewritten: &str, kind: CopilotHookOutput) -> Value {
-    let reason = format!(
-        "Token savings: use `{}` instead (rtk saves 60-90% tokens)",
-        rewritten
-    );
-    match kind {
-        CopilotHookOutput::VsCode => json!({
-            "hookSpecificOutput": {
-                "hookEventName": PRE_TOOL_USE_KEY,
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason
-            }
-        }),
-        CopilotHookOutput::CopilotCli => json!({
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason
-        }),
-    }
-}
+fn process_copilot_payload(v: &Value) -> Option<Value> {
+    let cmd = v
+        .pointer("/tool_input/command")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())?;
 
-fn handle_copilot_rewrite(cmd: &str, kind: CopilotHookOutput) -> Result<()> {
     if permissions::check_command(cmd) == PermissionVerdict::Deny {
         audit_log("deny", cmd, "");
-        return Ok(());
+        return None;
     }
 
-    let rewritten = match get_rewritten(cmd) {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-
+    let rewritten = get_rewritten(cmd)?;
     audit_log("rewrite", cmd, &rewritten);
-    let output = build_copilot_deny_output(&rewritten, kind);
-    let _ = writeln!(io::stdout(), "{output}");
-    Ok(())
+
+    let mut modified_args = v.get("tool_input").cloned().unwrap_or_else(|| json!({}));
+    if let Some(obj) = modified_args.as_object_mut() {
+        obj.insert("command".into(), Value::String(rewritten));
+    }
+
+    Some(json!({ "modifiedArgs": modified_args }))
 }
 
 // ── Gemini hook ───────────────────────────────────────────────
@@ -536,16 +516,11 @@ mod tests {
         })
     }
 
-    fn copilot_cli_input(cmd: &str) -> Value {
-        let args = serde_json::to_string(&json!({ "command": cmd })).unwrap();
-        json!({ "toolName": "bash", "toolArgs": args })
-    }
-
     #[test]
     fn test_detect_vscode_bash() {
         assert!(matches!(
             detect_format(&vscode_input("Bash", "git status")),
-            HookFormat::VsCode { .. }
+            HookFormat::VsCode
         ));
     }
 
@@ -553,15 +528,7 @@ mod tests {
     fn test_detect_vscode_run_terminal_command() {
         assert!(matches!(
             detect_format(&vscode_input("runTerminalCommand", "cargo test")),
-            HookFormat::VsCode { .. }
-        ));
-    }
-
-    #[test]
-    fn test_detect_copilot_cli_bash() {
-        assert!(matches!(
-            detect_format(&copilot_cli_input("git status")),
-            HookFormat::CopilotCli { .. }
+            HookFormat::VsCode
         ));
     }
 
@@ -594,31 +561,6 @@ mod tests {
     #[test]
     fn test_get_rewritten_heredoc() {
         assert!(get_rewritten("cat <<'EOF'\nhello\nEOF").is_none());
-    }
-
-    // --- build_copilot_deny_output ---
-
-    #[test]
-    fn test_copilot_deny_output_vscode_format() {
-        let out = build_copilot_deny_output("rtk git status", CopilotHookOutput::VsCode);
-        let hook = &out["hookSpecificOutput"];
-        assert_eq!(hook["hookEventName"], PRE_TOOL_USE_KEY);
-        assert_eq!(hook["permissionDecision"], "deny");
-        assert!(hook["permissionDecisionReason"]
-            .as_str()
-            .unwrap()
-            .contains("rtk git status"));
-    }
-
-    #[test]
-    fn test_copilot_deny_output_cli_format() {
-        let out = build_copilot_deny_output("rtk git status", CopilotHookOutput::CopilotCli);
-        assert_eq!(out["permissionDecision"], "deny");
-        assert!(out["permissionDecisionReason"]
-            .as_str()
-            .unwrap()
-            .contains("rtk git status"));
-        assert!(out.get("hookSpecificOutput").is_none());
     }
 
     // --- Gemini format ---
@@ -1014,7 +956,155 @@ mod tests {
     fn test_detect_vscode_run_in_terminal() {
         assert!(matches!(
             detect_format(&vscode_input("run_in_terminal", "git log --oneline -15")),
-            HookFormat::VsCode { .. }
+            HookFormat::VsCode
         ));
+    }
+
+    #[test]
+    fn test_detect_bash_lowercase_is_copilot_cli() {
+        assert!(matches!(
+            detect_format(&vscode_input("bash", "git status")),
+            HookFormat::CopilotCli
+        ));
+    }
+
+    #[test]
+    fn test_vscode_run_in_terminal_returns_deny() {
+        let input = json!({
+            "tool_name": "run_in_terminal",
+            "tool_input": {
+                "command": "git status",
+                "explanation": "check status",
+                "mode": "sync",
+                "timeout": 60000
+            }
+        })
+        .to_string();
+        let result = run_copilot_inner(&input).unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            v.get("modifiedArgs").is_none(),
+            "VsCode must not use modifiedArgs"
+        );
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(|d| d.as_str()),
+            Some("deny")
+        );
+        let reason = v
+            .pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        assert!(reason.contains("rtk"), "reason should suggest rtk command");
+    }
+
+    #[test]
+    fn test_vscode_bash_uppercase_returns_deny() {
+        let input = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "git status" }
+        })
+        .to_string();
+        let result = run_copilot_inner(&input).unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            v.get("modifiedArgs").is_none(),
+            "VsCode must not use modifiedArgs"
+        );
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(|d| d.as_str()),
+            Some("deny")
+        );
+    }
+
+    // --- Copilot modifiedArgs (new transparent rewrite) ---
+
+    fn run_copilot_inner(input: &str) -> Option<String> {
+        let v: Value = serde_json::from_str(input).ok()?;
+        match detect_format(&v) {
+            HookFormat::CopilotCli => process_copilot_payload(&v),
+            HookFormat::VsCode => process_vscode_payload(&v),
+            HookFormat::PassThrough => None,
+        }
+        .map(|o| o.to_string())
+    }
+
+    fn copilot_input(cmd: &str) -> String {
+        json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "bash",
+            "tool_input": { "command": cmd, "description": "run a shell command" }
+        })
+        .to_string()
+    }
+
+    fn copilot_input_with_extra(cmd: &str) -> String {
+        json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "bash",
+            "tool_input": {
+                "command": cmd,
+                "description": "run git status",
+                "initial_wait": 30
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_copilot_rewrite_returns_modified_args() {
+        let result = run_copilot_inner(&copilot_input("git status")).unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            v.get("modifiedArgs").is_some(),
+            "should have modifiedArgs key"
+        );
+        assert_eq!(v["modifiedArgs"]["command"], "rtk git status");
+    }
+
+    #[test]
+    fn test_copilot_rewrite_preserves_description() {
+        let result = run_copilot_inner(&copilot_input("git status")).unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["modifiedArgs"]["description"], "run a shell command");
+    }
+
+    #[test]
+    fn test_copilot_rewrite_preserves_extra_fields() {
+        let result = run_copilot_inner(&copilot_input_with_extra("git status")).unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["modifiedArgs"]["initial_wait"], 30);
+        assert_eq!(v["modifiedArgs"]["command"], "rtk git status");
+    }
+
+    #[test]
+    fn test_copilot_no_rewrite_returns_none() {
+        // Command not supported by rtk → no output
+        assert!(run_copilot_inner(&copilot_input("htop")).is_none());
+    }
+
+    #[test]
+    fn test_copilot_already_rtk_returns_none() {
+        assert!(run_copilot_inner(&copilot_input("rtk git status")).is_none());
+    }
+
+    #[test]
+    fn test_copilot_report_intent_passthrough() {
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "report_intent",
+            "tool_input": { "intent": "Checking git status" }
+        })
+        .to_string();
+        assert!(run_copilot_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_copilot_output_has_no_permission_decision() {
+        let result = run_copilot_inner(&copilot_input("git status")).unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert!(v.get("permissionDecision").is_none());
+        assert!(v.get("hookSpecificOutput").is_none());
     }
 }
